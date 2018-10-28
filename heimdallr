@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import atexit
+import datetime as dt
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from typing import Dict, Union
+
+LOCAL_TIMEZONE = datetime.now(dt.timezone.utc).astimezone().tzinfo
+
+
+def to_local_str(date: datetime):
+    """Convert a datetime into a string with local timezone."""
+    return date.replace(tzinfo=LOCAL_TIMEZONE).strftime('%Y-%m-%dT%H:%M:%S%Z')
+
+
+def parse_nvidia_smi(output):
+    """Parses the output of the command `nvidia-smi`."""
+    output = re.sub(r'^[+|][+=-]+[|+]\n', '', output, flags=re.MULTILINE)
+    output = re.sub(r'^\|\s*', '', output, flags=re.MULTILINE)
+    output = re.sub(r'\s*\|$', '', output, flags=re.MULTILINE)
+    output = re.sub(r'^\s*\n', '', output, flags=re.MULTILINE)
+    regex = re.compile(
+        r'''
+            (?P<nvidia_datetime>.*)\s*
+        NVIDIA-SMI\s*(?P<nvidia_smi_version>\d+\.\d+)\s*
+            Driver\sVersion:\s*(?P<driver_version>\d+\.\d+)\s*
+            CUDA\sVersion:\s*(?P<cuda_version>\d+\.\d+)\s*
+        GPU\s*Name\s*
+            Persistence-M+\s*\|\s*
+            Bus-Id\s*Disp.A\s*\|\s*
+            Volatile\s*Uncorr.\s*ECC\s*
+        Fan\s* Temp\s* Perf\s* Pwr:Usage/Cap\|\s*
+            Memory-Usage\s*\|\s*
+            GPU-Util\s*Compute\s*M.\s*
+        (?P<gpu_number>\d+)\s* (?P<gpu_name>[\w\s]+(?=\s+\w+\s+))\s+ (?P<persistence_m>\w+)\s* \|\s*
+            (?P<bus_id>\d+:\d+:\d+\.\d+)\s* (?P<disp_a>\w+)\s*\|\s*
+            (?P<ecc>.*\s*)
+        (?P<gpu_fan>\d+[%])\s* (?P<gpu_temp>\d+[C])\s* (?P<gpu_perf>\w+)\s* 
+            (?P<gpu_power_usage>\d+[W])\s* / \s*(?P<gpu_power_cap>\d+[W])\s* \|\s*
+            (?P<gpu_ram_usage>\d+MiB)\s*/\s*(?P<gpu_total_ram>\d+MiB)\s*\|\s*
+            (?P<gpu_util>\d+[%])\s*(?P<compute_m>\w+)\s*
+        Processes:\s*
+        GPU\s* Memory\s* GPU\s* PID\s* Type\s* Process\s* name\s* Usage\s*
+        (?P<proc_info>(?:\n|.)*)
+        ''',
+        flags=re.VERBOSE
+    )
+    m = regex.fullmatch(output)
+    info = m.groupdict()
+    procs = []
+    for line in m.group('proc_info').splitlines():
+        proc_m = re.fullmatch(
+            r'\s*(?P<gpu>\d+)\s*(?P<pid>\d+)\s*(?P<type>\w+)\s*(?P<name>.+)\s+(?P<mem_usage>\d+MiB)\s*',
+            line)
+        procs.append({k: v.strip() for k, v in proc_m.groupdict().items()})
+    info = {k: v.strip() for k, v in info.items()}
+    info['proc_info'] = procs
+    return info
+
+
+def monitor_gpu(output_file, header=False, pid=None):
+    """Calls `nvidia-smi` and writes a CSV line to the `output_file`.
+
+    If `header` is true then writes the header line too.
+    If `pid` is not `None` then it should be the pid of a process and only that process information will
+    be saved to the output file.
+
+    """
+    column_order = (
+        'datetime',
+        'nvidia_smi_version', 'driver_version', 'cuda_version',
+        'gpu_number', 'gpu_name', 'persistence_m', 'bus_id', 'disp_a', 'ecc',
+        'gpu_fan', 'gpu_temp', 'gpu_perf', 'gpu_power_usage', 'gpu_power_cap', 'gpu_ram_usage', 'gpu_total_ram',
+        'gpu_util', 'compute_m',
+        'proc_info',
+    )
+    proc_order = ('pid', 'gpu', 'mem_usage', 'type', 'name')
+    with open(output_file, 'a') as out:
+        if header:
+            out.write(';'.join(column_order) + '\n')
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE)
+        res = parse_nvidia_smi(result.stdout.decode('utf-8'))
+        res['datetime'] = to_local_str(datetime.strptime(res.pop('nvidia_datetime'), '%a %b %d %H:%M:%S %Y'))
+        if pid is not None:
+            procs = [v for v in res['proc_info'] if v['pid'] == str(pid)]
+        else:
+            procs = res['proc_info']
+        res['proc_info'] = '|'.join(','.join(proc[k] for k in proc_order) for proc in procs)
+        out.write(';'.join(res[k] for k in column_order) + '\n')
+
+
+def parse_sensors(output):
+    """Parses the output of the `sensors` command."""
+    matches = re.finditer(
+        r'(?P<core>Core \d+):\s*(?P<temp>[-+]?\d+\.\d+°C)\s*'
+        r'\(high = (?P<high_temp>[-+]?\d+\.\d+°C), crit = (?P<crit_temp>[-+]?\d+\.\d+°C)\)',
+        output
+    )
+    res = {}
+    for match in matches:
+        res[match.group('core')] = {
+            'temp': match['temp'], 'high_temp': match['high_temp'], 'crit_temp': match['crit_temp']
+        }
+    return res
+
+
+def monitor_cpu_temps(output_file, header=False):
+    """Executes the `sensors` command and saves a csv line to `output_file`.
+
+    If `header` is true also writes the header to the file.
+
+    """
+    column_order = ('datetime', 'core', 'temp', 'high_temp', 'crit_temp')
+    core_order = column_order[2:]
+    with open(output_file, 'a') as out:
+        if header:
+            out.write(';'.join(column_order) + '\n')
+        result = subprocess.run(['sensors'], stdout=subprocess.PIPE)
+        res = parse_sensors(result.stdout.decode('utf-8'))
+        timestamp = to_local_str(datetime.now())
+        for core, values in res.items():
+            out.write('{};{};{}\n'.format(timestamp, core, ';'.join(values[k] for k in core_order)))
+
+
+def parse_top(output: str) -> Dict[str, Union[str, Dict[str, str]]]:
+    """Parses the output of the `top` command."""
+    regex = re.compile(
+        r'''
+            top\s*-\s*(?P<time>\d+:\d+:\d+)\s*
+                up\s*(?P<uptime>[^,]+),\s*
+                (?P<num_users>\d+)\s*users,\s*
+                load\s*average:\s*(?P<load_avg_1>[\d,]+),\s*(?P<load_avg_2>[\d,]+),\s*(?P<load_avg_3>[\d,]+)\s*
+            Tasks:\s*(?P<num_tasks>\d+)\s*total,\s*
+                (?P<num_running_tasks>\d+)\s*running,\s*
+                (?P<num_sleeping_tasks>\d+)\s*sleeping,\s*
+                (?P<num_stopped_tasks>\d+)\s*stopped,\s*
+                (?P<num_zombie_tasks>\d+)\s*zombie\s*
+            %Cpu\(s\):\s*(?P<user_cpu>[\d,]+)\s*us,\s*
+                (?P<system_cpu>[\d,]+)\s*sy,\s*
+                (?P<ni_cpu>[\d,]+)\s*ni,\s*
+                (?P<id_cpu>[\d,]+)\s*id,\s*
+                (?P<wa_cpu>[\d,]+)\s*wa,\s*
+                (?P<hi_cpu>[\d,]+)\s*hi,\s*
+                (?P<si_cpu>[\d,]+)\s*si,\s*
+                (?P<st_cpu>[\d,]+)\s*st\s*
+            (?P<ram_unit>\w+)\s*Mem\s*:\s*
+                (?P<ram_total>\d+)\s*total,\s*
+                (?P<free_ram>\d+)\s*free,\s*
+                (?P<used_ram>\d+)\s*used,\s*
+                (?P<ram_buff_cache>\d+)\s*buff/cache\s*
+            (?P<swap_unit>\w+)\s*Swap:\s*
+                (?P<swap_total>\d+)\s*total,\s*
+                (?P<swap_free>\d+)\s*free,\s*
+                (?P<swap_used>\d+)\s*used.\s*
+                (?P<avail>\d+)\s*avail\s*Mem\s*.*\s*
+            (?P<proc_info>(?:.|\n)+)
+        ''',
+        re.VERBOSE
+    )
+    res = regex.fullmatch(output).groupdict()
+    procs = []
+    for line in res['proc_info'].splitlines():
+        proc_res = re.fullmatch(
+            r'\s*(?P<pid>\S+)\s*(?P<user>\S+)\s*(?P<priority>\S+)\s*(?P<nice>\S+)\s*'
+            r'(?P<virtual_mem>\S+)\s*(?P<res_mem>\S+)\s*(?P<shared_mem>\S+)\s*\S+\s*'
+            r'(?P<perc_cpu>[\d,]+)\s*(?P<perc_mem>[\d,]+)\s*'
+            r'(?P<uptime>\S+)\s*(?P<command>.*)\s*',
+            line
+        )
+        procs.append(proc_res.groupdict())
+    return dict(**res, proc_info=procs)
+
+
+def monitor_top(output_file, header=False, pid=None):
+    """Runs the `top` command and saves a CSV line with the information to `output_file`.
+
+    If `header` is true the header is also written to `output_file`.
+    If `pid` is specified then only information regarding that PID is saved.
+
+    """
+    column_order = (
+        'datetime',
+        'uptime', 'num_users', 'load_avg_1', 'load_avg_2', 'load_avg_3',
+        'num_tasks', 'num_running_tasks', 'num_sleeping_tasks', 'num_stopped_tasks', 'num_zombie_tasks',
+        'user_cpu', 'system_cpu',
+        'ram_unit', 'ram_total', 'free_ram', 'used_ram', 'ram_buff_cache',
+        'swap_unit', 'swap_total', 'swap_free', 'swap_used', 'avail',
+        'proc_info',
+    )
+    proc_order = ('pid', 'user', 'perc_cpu', 'perc_mem', 'virtual_mem', 'res_mem', 'shared_mem', 'uptime', 'command')
+    with open(output_file, 'a') as out:
+        if header:
+            out.write(';'.join(column_order) + '\n')
+        result = subprocess.run(['top', '-n', '1', '-b'] + ([] if pid is None else ['-p', str(pid)]),
+                                stdout=subprocess.PIPE)
+        res = parse_top(result.stdout.decode('utf-8'))
+        res['datetime'] = to_local_str(datetime.now())
+        # noinspection PyTypeChecker
+        res['proc_info'] = '|'.join(','.join(proc[k] for k in proc_order) for proc in res['proc_info'])
+        out.write(';'.join(res[k] for k in column_order) + '\n' + '\n')
+
+
+def parse_interval(interval):
+    """Parse a time interval into the equivalent number of seconds:
+
+        >>> parse_interval("5s")
+        5
+        >>> parse_interval("2m")
+        120
+        >>> parse_interval("1.5h")
+        5472.0
+
+    """
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)([smh])', interval)
+    return float(match[1]) * ({'s': 1, 'm': 60, 'h': 60 * 60}[match[2]])
+
+
+def run(interval, gpu, temperatures, cpu_and_ram, pid):
+    """Mainloop that calls the `monitor_*` function and then sleeps for `interval` seconds."""
+    first = True
+    while True:
+        if gpu:
+            monitor_gpu(gpu, pid=pid, header=first)
+        if temperatures:
+            monitor_cpu_temps(temperatures, header=first)
+        if cpu_and_ram:
+            monitor_top(cpu_and_ram, pid=pid, header=first)
+        first = False
+        time.sleep(interval)
+
+
+def _make_parser():
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument('-i', '--interval', type=parse_interval, default='30s',
+                               help='Interval between measurements.\nSyntax is: \d+(\.\d+)?(s|m|h).')
+    parent_parser.add_argument('-g', '--gpu', help='Monitor GPU usage', metavar='LOGFILE')
+    parent_parser.add_argument('-t', '--temperatures', help='Monitor temperatures of CPU', metavar='LOGFILE')
+    parent_parser.add_argument('-c', '--cpu', '--cpu-and-ram', dest='cpu_and_ram', metavar='LOGFILE',
+                               help='Monitor processes, CPU & RAM usage via top')
+    parent_parser.add_argument('-q', '--quiet', action='store_false', dest='verbose',
+                               help="Don't write error messages to stdout")
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest='command')
+
+    monitor_parser = subparsers.add_parser('monitor', parents=[parent_parser])
+    monitor_parser.add_argument('-p', '--pid', type=int, help='Pid of the process to monitor for CPU&GPU usage.')
+
+    launch_parser = subparsers.add_parser('launch', parents=[parent_parser])
+    launch_parser.add_argument('-o', '--output', default='-', help='Subprocess stdout')
+    launch_parser.add_argument('-e', '--error', default='-', help='Subprocess stderr')
+    launch_parser.add_argument('--input', default='-', help='Subprocess stdin')
+    launch_parser.add_argument('--keep-alive', action='store_true', help='Keep running task when monitor process exits')
+    launch_parser.add_argument('cmdline', nargs='+', help='The command to launch and monitor.')
+
+    return parser
+
+
+def monitor(args):
+    if args.pid is not None and args.gpu is None and args.cpu_and_ram is None and args.verbose:
+        sys.stderr.write('Monitoring pid {} but neither --gpu nor --cpu-and-ram options provided'.format(args.pid))
+    run(args.interval, gpu=args.gpu, temperatures=args.temperatures, cpu_and_ram=args.cpu_and_ram, pid=args.pid)
+
+
+@contextmanager
+def name_of_temporary_file(verbose=False):
+    # best-effort to remove the temporary file when we are done
+    fd, tmp_filename = tempfile.mkstemp(suffix='.heimdallr')
+    os.close(fd)
+    try:
+        yield tmp_filename
+    finally:
+        try:
+            os.remove(tmp_filename)
+        except Exception as e:
+            if verbose:
+                msg = "Failed to delete temporary file {0}.\n{1.__class__.__name__}: {1}"
+                sys.stderr.write(msg.format(tmp_filename, e))
+
+
+def _run_subprocess(cmdline, in_filename, out_filename, err_filename, preexec_fn=lambda: None):
+    in_filename = argparse.FileType('rb')(in_filename)
+    outer = argparse.FileType('wb')
+    return subprocess.Popen(
+        cmdline,
+        stdin=in_filename,
+        stdout=outer(out_filename),
+        stderr=outer(err_filename),
+        preexec_fn=preexec_fn
+    )
+
+
+def _middle_process(tmp_filename, args):
+    # setsid needed to make sure we don't get killed when our parent dies.
+    os.setsid()
+    os.umask(0)
+    # spawn the background task
+    proc = _run_subprocess(args.cmdline, args.input, args.output, args.error)
+    proc_pid = proc.pid
+    # store the pid of the background task in the temporary file
+    with open(tmp_filename, 'wb') as f:
+        f.write(str(proc_pid).encode('ascii') + b'\n')
+    # quit this process immediately. No cleanup (the file above should have already flushed everything.
+    os._exit(0)
+
+
+def launch(args):
+    """Spawns a background process and then monitors it.
+
+    If `args.keep_alive` is `True`, then it ensures that the background task is not killed when this process exits,
+    while if `args.keep_alive` is `False` it ensures that the background task is killed when this process exits.
+
+    """
+    if args.keep_alive:
+        try:
+            # make sure that monitor can be killed without killing the background task
+            # to achieve this we have to fork twice, so that the background task gets inherited by
+            # the process 1 (either init or systemd or whatever).
+            # We need its pid so we create a temporary file where the middle-process writes the task's pid.
+            with name_of_temporary_file(args.verbose) as tmp_filename:
+                cpid = os.fork()
+                if cpid == 0:
+                    # we are the child process
+                    _middle_process(tmp_filename, args)
+                else:
+                    # we are the original Heimdallr process. Wait for the middle process to die
+                    os.waitpid(cpid, 0)
+                    # get the pid of the background process we have to monitor.
+                    with open(tmp_filename) as pid_file:
+                        args.pid = int(pid_file.read())
+                        if args.verbose:
+                            sys.stderr.write('Background task has PID: {}\n'.format(args.pid))
+        except Exception as e:
+            if hasattr(args, 'pid'):
+                # probably an issue with deleting the temporary file?
+                sys.stderr.write('Error after starting background task.\n{0.__class__.__name__}: {0}'.format(e))
+            else:
+                msg = (
+                    "Error during or after starting the background task. It may or may not have started successfully.\n"
+                    "{0.__class__.__name__}: {0}\n"
+                )
+                sys.stderr.write(msg.format(e))
+                sys.exit(1)
+    else:
+        # in this case we want to ensure that the background task gets killed with us.
+        # we register an atexit function that kills it, first via SIGTERM and after 5 seconds SIGKILL.
+        proc = _run_subprocess(args.cmdline, args.stdin, args.stdout, args.stderr, preexec_fn=os.setsid)
+        kill_gently = create_gentle_killer(proc, args.verbose)
+        victim_id = os.getpgid(proc.pid)
+        atexit.register(kill_gently, victim_id)
+        signal.signal(signal.SIGTERM, lambda _: kill_gently(victim_id))
+        signal.signal(signal.SIGABRT, lambda _: kill_gently(victim_id))
+
+    monitor(args)
+
+
+def create_gentle_killer(proc, verbose):
+    """Returns a function that will try to kill the given process and corresponding process group."""
+    proc_pid = proc.pid
+    if verbose:
+        log = sys.stderr.write
+    else:
+        def log(_):
+            """noop"""
+
+    def kill_gently(victim_id):
+        """Kills the process group `victim_id` and then terminates the current process with exit code 1."""
+        # try with SIGTERM
+        try:
+            log("Killing background task gently...")
+            try:
+                os.killpg(victim_id, signal.SIGTERM)
+                if proc.poll() is None:
+                    log("Waiting 5 seconds.\n")
+                    time.sleep(5)
+                else:
+                    log("Task killed.\n")
+            except Exception as e:
+                log("got an exception: {0.__class__.__name__}: {0}\n".format(e))
+
+            if proc.poll() is None:
+                # stop being gentle. Go with SIGKILL
+                log("killing background task BRUTALLY...")
+                try:
+                    os.killpg(victim_id, signal.SIGKILL)
+                    log("Task brutally killed.\n")
+                except Exception as e:
+                    msg = (
+                        "got an exception: {0.__class__.__name__}: {0}\n"
+                        "The background task with pid: {1} might still be alive!\n"
+                    )
+                    log(msg.format(e, proc_pid))
+        finally:
+            log('Exiting main process.')
+            sys.exit(1)
+
+    return kill_gently
+
+
+def main():
+    args = _make_parser().parse_args()
+    if args.command == 'launch':
+        launch(args)
+    else:
+        monitor(args)
+
+
+if __name__ == '__main__':
+    main()
