@@ -178,7 +178,8 @@ def parse_top(output: str) -> Dict[str, Union[str, Dict[str, str]]]:
             line
         )
         procs.append(proc_res.groupdict())
-    return dict(**res, proc_info=procs)
+    res['proc_info']=procs
+    return res
 
 
 def monitor_top(output_file, header=False, pid=None):
