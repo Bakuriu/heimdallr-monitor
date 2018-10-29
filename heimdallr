@@ -178,7 +178,7 @@ def parse_top(output: str) -> Dict[str, Union[str, Dict[str, str]]]:
             line
         )
         procs.append(proc_res.groupdict())
-    res['proc_info']=procs
+    res['proc_info'] = procs
     return res
 
 
@@ -226,9 +226,18 @@ def parse_interval(interval):
     return float(match[1]) * ({'s': 1, 'm': 60, 'h': 60 * 60}[match[2]])
 
 
+def _pid_exists(pid):
+    """Return True if a process with the given pid exists. False otherwise."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def run(interval, gpu, temperatures, cpu_and_ram, pid, write_header=True):
     """Mainloop that calls the `monitor_*` function and then sleeps for `interval` seconds."""
-    while True:
+    while pid is None or _pid_exists(pid):
         if gpu:
             monitor_gpu(gpu, pid=pid, header=write_header)
         if temperatures:
