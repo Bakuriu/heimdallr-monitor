@@ -259,9 +259,9 @@ def _make_parser():
     monitor_parser.add_argument('-p', '--pid', type=int, help='Pid of the process to monitor for CPU&GPU usage.')
 
     launch_parser = subparsers.add_parser('launch', parents=[parent_parser])
-    launch_parser.add_argument('-o', '--output', default='-', help='Subprocess stdout')
-    launch_parser.add_argument('-e', '--error', default='-', help='Subprocess stderr')
-    launch_parser.add_argument('--input', default='-', help='Subprocess stdin')
+    launch_parser.add_argument('-o', '--output', dest='stdout', default='-', help='Subprocess stdout')
+    launch_parser.add_argument('-e', '--error', dest='stderr', default='-', help='Subprocess stderr')
+    launch_parser.add_argument('-I', '--input', dest='stdin', default='-', help='Subprocess stdin')
     launch_parser.add_argument('--keep-alive', action='store_true', help='Keep running task when monitor process exits')
     launch_parser.add_argument('cmdline', nargs='+', metavar='CMD', help='The command to launch and monitor.')
 
@@ -314,7 +314,7 @@ def _middle_process(tmp_filename, args):
     os.setsid()
     os.umask(0)
     # spawn the background task
-    proc = _run_subprocess(args.cmdline, args.input, args.output, args.error)
+    proc = _run_subprocess(args.cmdline, args.stdin, args.stdout, args.stderr)
     proc_pid = proc.pid
     # store the pid of the background task in the temporary file
     with open(tmp_filename, 'wb') as f:
@@ -364,6 +364,7 @@ def launch(args):
         # in this case we want to ensure that the background task gets killed with us.
         # we register an atexit function that kills it, first via SIGTERM and after 5 seconds SIGKILL.
         proc = _run_subprocess(args.cmdline, args.stdin, args.stdout, args.stderr, preexec_fn=os.setsid)
+        args.pid = proc.pid
         kill_gently = create_gentle_killer(proc, args.verbose)
         victim_id = os.getpgid(proc.pid)
         atexit.register(kill_gently, victim_id)
