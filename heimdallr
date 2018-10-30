@@ -335,7 +335,7 @@ def monitor(args):
         cpu_and_ram=args.cpu_and_ram,
         pid=args.pid,
         write_header=args.write_header,
-        backup_bad_output=args.backup_dir_output,
+        backup_bad_output=args.backup_bad_output,
         backup_dir=args.backup_dir,
     )
 
