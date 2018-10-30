@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name='heimdallr',
-    version='0.1.0',
+    version='0.2.0',
     author='Giacomo Alzetta',
     author_email='giacomo.alzetta+heimdallr@gmail.com',
     scripts=['heimdallr'],
