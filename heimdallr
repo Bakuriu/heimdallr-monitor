@@ -23,7 +23,7 @@ def to_local_str(date: datetime):
     return date.replace(tzinfo=LOCAL_TIMEZONE).strftime('%Y-%m-%dT%H:%M:%S%Z')
 
 
-def parse_nvidia_smi(output):
+def parse_nvidia_smi(output, backup_bad_output=False, backup_dir='/tmp'):
     """Parses the output of the command `nvidia-smi`."""
     output = re.sub(r'^[+|][+=-]+[|+]\n', '', output, flags=re.MULTILINE)
     output = re.sub(r'^\|\s*', '', output, flags=re.MULTILINE)
@@ -56,19 +56,35 @@ def parse_nvidia_smi(output):
         flags=re.VERBOSE
     )
     m = regex.fullmatch(output)
-    info = m.groupdict()
-    procs = []
-    for line in m.group('proc_info').splitlines():
-        proc_m = re.fullmatch(
-            r'\s*(?P<gpu>\d+)\s*(?P<pid>\d+)\s*(?P<type>\w+)\s*(?P<name>.+)\s+(?P<mem_usage>\d+MiB)\s*',
-            line)
-        procs.append({k: v.strip() for k, v in proc_m.groupdict().items()})
-    info = {k: v.strip() for k, v in info.items()}
-    info['proc_info'] = procs
+    if m:
+        info = m.groupdict()
+        procs = []
+        for line in m.group('proc_info').splitlines():
+            proc_m = re.fullmatch(
+                r'\s*(?P<gpu>\d+)\s*(?P<pid>\d+)\s*(?P<type>\w+)\s*(?P<name>.+)\s+(?P<mem_usage>\d+MiB)\s*',
+                line)
+            procs.append({k: v.strip() for k, v in proc_m.groupdict().items()})
+        info = {k: v.strip() for k, v in info.items()}
+        info['proc_info'] = procs
+    else:
+        now = datetime.now()
+        if backup_bad_output:
+            with open(os.path.join(backup_dir, 'bad_nvidia_smi_{}.txt'.format(to_local_str(now))), 'w') as bad_file:
+                bad_file.write(output)
+
+        keys_defined = (
+            'nvidia_datetime', 'nvidia_smi_version', 'driver_version', 'cuda_version',
+            'gpu_number', 'gpu_name', 'persistence_m', 'bus_id', 'disp_a', 'ecc',
+            'gpu_fan', 'gpu_temp', 'gpu_perf', 'gpu_power_usage', 'gpu_power_cap', 'gpu_ram_usage', 'gpu_total_ram',
+            'gpu_util', 'compute_m',
+        )
+        info = dict.fromkeys(keys_defined, value='N/A')
+        info['nvidia_datetime'] = now.replace(tzinfo=LOCAL_TIMEZONE).strftime('%a %b %d %H:%M:%S %Y')
+        info['proc_info'] = []
     return info
 
 
-def monitor_gpu(output_file, header=False, pid=None):
+def monitor_gpu(output_file, pid=None, header=False, backup_bad_output=False, backup_dir='/tmp'):
     """Calls `nvidia-smi` and writes a CSV line to the `output_file`.
 
     If `header` is true then writes the header line too.
@@ -89,7 +105,7 @@ def monitor_gpu(output_file, header=False, pid=None):
         if header:
             out.write(';'.join(column_order) + '\n')
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE)
-        res = parse_nvidia_smi(result.stdout.decode('utf-8'))
+        res = parse_nvidia_smi(result.stdout.decode('utf-8'), backup_bad_output, backup_dir)
         res['datetime'] = to_local_str(datetime.strptime(res.pop('nvidia_datetime'), '%a %b %d %H:%M:%S %Y'))
         if pid is not None:
             procs = [v for v in res['proc_info'] if v['pid'] == str(pid)]
@@ -99,7 +115,7 @@ def monitor_gpu(output_file, header=False, pid=None):
         out.write(';'.join(res[k] for k in column_order) + '\n')
 
 
-def parse_sensors(output):
+def parse_sensors(output, backup_bad_output=False, backup_dir='/tmp'):
     """Parses the output of the `sensors` command."""
     matches = re.finditer(
         r'(?P<core>Core \d+):\s*(?P<temp>[-+]?\d+\.\d+°C)\s*'
@@ -111,10 +127,21 @@ def parse_sensors(output):
         res[match.group('core')] = {
             'temp': match['temp'], 'high_temp': match['high_temp'], 'crit_temp': match['crit_temp']
         }
+    if not res:
+        now = datetime.now()
+        if backup_bad_output:
+            with open(os.path.join(backup_dir, 'bad_sensors_{}.txt'.format(to_local_str(now))), 'w') as bad_file:
+                bad_file.write(output)
+
+        keys_defined = (
+            'temp', 'high_temp', 'crit_temp',
+        )
+        core_info = dict.fromkeys(keys_defined, value='N/A')
+        return {'core N/A': core_info}
     return res
 
 
-def monitor_cpu_temps(output_file, header=False):
+def monitor_cpu_temps(output_file, header=False, backup_bad_output=False, backup_dir='/tmp'):
     """Executes the `sensors` command and saves a csv line to `output_file`.
 
     If `header` is true also writes the header to the file.
@@ -126,13 +153,13 @@ def monitor_cpu_temps(output_file, header=False):
         if header:
             out.write(';'.join(column_order) + '\n')
         result = subprocess.run(['sensors'], stdout=subprocess.PIPE)
-        res = parse_sensors(result.stdout.decode('utf-8'))
+        res = parse_sensors(result.stdout.decode('utf-8'), backup_bad_output, backup_dir)
         timestamp = to_local_str(datetime.now())
         for core, values in res.items():
             out.write('{};{};{}\n'.format(timestamp, core, ';'.join(values[k] for k in core_order)))
 
 
-def parse_top(output: str) -> Dict[str, Union[str, Dict[str, str]]]:
+def parse_top(output: str, backup_bad_output=False, backup_dir='/tmp') -> Dict[str, Union[str, Dict[str, str]]]:
     """Parses the output of the `top` command."""
     regex = re.compile(
         r'''
@@ -167,22 +194,39 @@ def parse_top(output: str) -> Dict[str, Union[str, Dict[str, str]]]:
         ''',
         re.VERBOSE
     )
-    res = regex.fullmatch(output).groupdict()
-    procs = []
-    for line in res['proc_info'].splitlines():
-        proc_res = re.fullmatch(
-            r'\s*(?P<pid>\S+)\s*(?P<user>\S+)\s*(?P<priority>\S+)\s*(?P<nice>\S+)\s*'
-            r'(?P<virtual_mem>\S+)\s*(?P<res_mem>\S+)\s*(?P<shared_mem>\S+)\s*\S+\s*'
-            r'(?P<perc_cpu>[\d,]+)\s*(?P<perc_mem>[\d,]+)\s*'
-            r'(?P<uptime>\S+)\s*(?P<command>.*)\s*',
-            line
+    m = regex.fullmatch(output)
+    if m:
+        res = m.groupdict()
+        procs = []
+        for line in res['proc_info'].splitlines():
+            proc_res = re.fullmatch(
+                r'\s*(?P<pid>\S+)\s*(?P<user>\S+)\s*(?P<priority>\S+)\s*(?P<nice>\S+)\s*'
+                r'(?P<virtual_mem>\S+)\s*(?P<res_mem>\S+)\s*(?P<shared_mem>\S+)\s*\S+\s*'
+                r'(?P<perc_cpu>[\d,]+)\s*(?P<perc_mem>[\d,]+)\s*'
+                r'(?P<uptime>\S+)\s*(?P<command>.*)\s*',
+                line
+            )
+            procs.append(proc_res.groupdict())
+        res['proc_info'] = procs
+    else:
+        now = datetime.now()
+        if backup_bad_output:
+            with open(os.path.join(backup_dir, 'bad_top_{}.txt'.format(to_local_str(now))), 'w') as bad_file:
+                bad_file.write(output)
+
+        keys_defined = (
+            'time', 'uptime', 'num_users', 'load_avg_1', 'load_avg_2', 'load_avg_3',
+            'num_tasks', 'num_running_tasks', 'num_sleeping_tasks', 'num_stopped_tasks', 'num_zombie_tasks',
+            'user_cpu', 'system_cpu', 'ni_cpu', 'id_cpu', 'wa_cpu', 'hi_cpu', 'si_cpu', 'st_cpu',
+            'ram_unit', 'ram_total', 'free_ram', 'used_ram', 'ram_buff_cache',
+            'swap_unit', 'swap_total', 'swap_free', 'swap_used', 'avail'
         )
-        procs.append(proc_res.groupdict())
-    res['proc_info'] = procs
+        res = dict.fromkeys(keys_defined, value='N/A')
+        res['proc_info'] = []
     return res
 
 
-def monitor_top(output_file, header=False, pid=None):
+def monitor_top(output_file, pid=None, header=False, backup_bad_output=False, backup_dir='/tmp'):
     """Runs the `top` command and saves a CSV line with the information to `output_file`.
 
     If `header` is true the header is also written to `output_file`.
@@ -204,7 +248,7 @@ def monitor_top(output_file, header=False, pid=None):
             out.write(';'.join(column_order) + '\n')
         result = subprocess.run(['top', '-n', '1', '-b'] + ([] if pid is None else ['-p', str(pid)]),
                                 stdout=subprocess.PIPE)
-        res = parse_top(result.stdout.decode('utf-8'))
+        res = parse_top(result.stdout.decode('utf-8'), backup_bad_output, backup_dir)
         res['datetime'] = to_local_str(datetime.now())
         # noinspection PyTypeChecker
         res['proc_info'] = '|'.join(','.join(proc[k] for k in proc_order) for proc in res['proc_info'])
@@ -235,15 +279,15 @@ def _pid_exists(pid):
         return False
 
 
-def run(interval, gpu, temperatures, cpu_and_ram, pid, write_header=True):
+def run(interval, gpu, temperatures, cpu_and_ram, pid, write_header=True, backup_bad_output=False, backup_dir='/tmp'):
     """Mainloop that calls the `monitor_*` function and then sleeps for `interval` seconds."""
     while pid is None or _pid_exists(pid):
         if gpu:
-            monitor_gpu(gpu, pid=pid, header=write_header)
+            monitor_gpu(gpu, pid, write_header, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
         if temperatures:
-            monitor_cpu_temps(temperatures, header=write_header)
+            monitor_cpu_temps(temperatures, write_header, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
         if cpu_and_ram:
-            monitor_top(cpu_and_ram, pid=pid, header=write_header)
+            monitor_top(cpu_and_ram, pid, write_header, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
         write_header = False
         time.sleep(interval)
 
@@ -260,6 +304,10 @@ def _make_parser():
                                help="Don't write error messages to stdout")
     parent_parser.add_argument('--no-header', action='store_false', dest='write_header',
                                help='Do not write the header to the log files when starting.')
+    parent_parser.add_argument('-b', '--backup-bad-output', action='store_true',
+                               help='If the output of the monitoring programs cannot be matched save it.')
+    parent_parser.add_argument('-B', '--backup-dir', default='/tmp',
+                               help='Directory where the backup outputs will be saved')
 
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest='command')
@@ -287,6 +335,8 @@ def monitor(args):
         cpu_and_ram=args.cpu_and_ram,
         pid=args.pid,
         write_header=args.write_header,
+        backup_bad_output=args.backup_dir_output,
+        backup_dir=args.backup_dir,
     )
 
 
