@@ -78,7 +78,7 @@ def parse_nvidia_smi(output, backup_bad_output=False, backup_dir='/tmp'):
             'gpu_fan', 'gpu_temp', 'gpu_perf', 'gpu_power_usage', 'gpu_power_cap', 'gpu_ram_usage', 'gpu_total_ram',
             'gpu_util', 'compute_m',
         )
-        info = dict.fromkeys(keys_defined, value='N/A')
+        info = dict.fromkeys(keys_defined, 'N/A')
         info['nvidia_datetime'] = now.replace(tzinfo=LOCAL_TIMEZONE).strftime('%a %b %d %H:%M:%S %Y')
         info['proc_info'] = []
     return info
@@ -136,7 +136,7 @@ def parse_sensors(output, backup_bad_output=False, backup_dir='/tmp'):
         keys_defined = (
             'temp', 'high_temp', 'crit_temp',
         )
-        core_info = dict.fromkeys(keys_defined, value='N/A')
+        core_info = dict.fromkeys(keys_defined, 'N/A')
         return {'core N/A': core_info}
     return res
 
@@ -221,7 +221,7 @@ def parse_top(output: str, backup_bad_output=False, backup_dir='/tmp') -> Dict[s
             'ram_unit', 'ram_total', 'free_ram', 'used_ram', 'ram_buff_cache',
             'swap_unit', 'swap_total', 'swap_free', 'swap_used', 'avail'
         )
-        res = dict.fromkeys(keys_defined, value='N/A')
+        res = dict.fromkeys(keys_defined, 'N/A')
         res['proc_info'] = []
     return res
 
