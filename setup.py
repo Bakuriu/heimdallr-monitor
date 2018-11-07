@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
@@ -8,7 +8,8 @@ setup(
     version='0.2.0',
     author='Giacomo Alzetta',
     author_email='giacomo.alzetta+heimdallr@gmail.com',
-    scripts=['heimdallr'],
+    packages=find_packages('src'),
+    package_dir={'': 'src'},
     license='MIT',
     description='Monitor CPU,GPU,RAM & temperatures of the system or a process',
     long_description=long_description,
@@ -31,5 +32,8 @@ setup(
         'Natural Language :: English',
         'Topic :: System :: Monitoring',
         'Topic :: Utilities',
-    ]
+    ],
+    entry_points = {
+        'console_scripts': ['heimdallr = heimdallr.main:main'],
+    }
 )

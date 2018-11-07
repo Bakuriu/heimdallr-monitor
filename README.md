@@ -40,23 +40,28 @@ The syntax of the command is the following:
 
 ```
 $ heimdallr monitor -h
-usage: heimdallr monitor [-h] [-i INTERVAL] [-g LOGFILE] [-t LOGFILE]
-                         [-c LOGFILE] [-q] [-p PID]
+usage: heimdallr monitor [-h] [-i INTERVAL] [-r NAME LOGFILE] [-q]
+                         [--no-header] [-b DIR] [-p PID]
 
 optional arguments:
   -h, --help            show this help message and exit
   -i INTERVAL, --interval INTERVAL
                         Interval between measurements. Syntax is:
                         \d+(\.\d+)?(s|m|h).
-  -g LOGFILE, --gpu LOGFILE
-                        Monitor GPU usage
-  -t LOGFILE, --temperatures LOGFILE
-                        Monitor temperatures of CPU
-  -c LOGFILE, --cpu LOGFILE, --cpu-and-ram LOGFILE
-                        Monitor processes, CPU & RAM usage via top
+  -r NAME LOGFILE, --resource NAME LOGFILE
+                        Monitor the given resource
   -q, --quiet           Don't write error messages to stdout
-  -p PID, --pid PID     Pid of the process to monitor for CPU&GPU usage.
+  --no-header           Do not write the header to the log files when
+                        starting.
+  -b DIR, --backup-bad-output-dir DIR
+                        Directory where the backup outputs will be saved.
+  -p PID, --pid PID     Pid of the process to monitor.
 ```
+
+You can specify a resource to monitor using the `-r` / `--resource` option.
+It takes a name of a resource, for example `gpu`, and the logfile where you wish to write
+the data.
+
 
 ### Launching and monitoring a command
 
@@ -67,33 +72,35 @@ a single argument.
 The syntax of `launch` is the following:
 
 ```
-$ python3 heimdallr launch -h
-usage: heimdallr launch [-h] [-i INTERVAL] [-g LOGFILE] [-t LOGFILE]
-                        [-c LOGFILE] [-q] [-o OUTPUT] [-e ERROR]
-                        [--input INPUT] [--keep-alive]
-                        cmdline [cmdline ...]
+$ heimdallr launch -h
+usage: heimdallr launch [-h] [-i INTERVAL] [-r NAME LOGFILE] [-q]
+                        [--no-header] [-b DIR] [-o STDOUT] [-e STDERR]
+                        [-I STDIN] [--keep-alive]
+                        CMD [CMD ...]
 
 positional arguments:
-  cmdline               The command to launch and monitor.
+  CMD                   The command to launch and monitor.
 
 optional arguments:
   -h, --help            show this help message and exit
   -i INTERVAL, --interval INTERVAL
                         Interval between measurements. Syntax is:
                         \d+(\.\d+)?(s|m|h).
-  -g LOGFILE, --gpu LOGFILE
-                        Monitor GPU usage
-  -t LOGFILE, --temperatures LOGFILE
-                        Monitor temperatures of CPU
-  -c LOGFILE, --cpu LOGFILE, --cpu-and-ram LOGFILE
-                        Monitor processes, CPU & RAM usage via top
+  -r NAME LOGFILE, --resource NAME LOGFILE
+                        Monitor the given resource
   -q, --quiet           Don't write error messages to stdout
-  -o OUTPUT, --output OUTPUT
+  --no-header           Do not write the header to the log files when
+                        starting.
+  -b DIR, --backup-bad-output-dir DIR
+                        Directory where the backup outputs will be saved.
+  -o STDOUT, --output STDOUT
                         Subprocess stdout
-  -e ERROR, --error ERROR
+  -e STDERR, --error STDERR
                         Subprocess stderr
-  --input INPUT         Subprocess stdin
+  -I STDIN, --input STDIN
+                        Subprocess stdin
   --keep-alive          Keep running task when monitor process exits
+
 ```
 
 It has all the options of `monitor` but in addition you can control the `stdout`, `stderr` and `stdin`
