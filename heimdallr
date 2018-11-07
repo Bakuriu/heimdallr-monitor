@@ -12,7 +12,7 @@ import tempfile
 import subprocess
 import datetime as dt
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from csv import DictWriter
 from datetime import datetime
 from typing import Dict, Iterable, List
@@ -27,10 +27,8 @@ def to_local_str(date: datetime):
 
 
 class Resource(ABC):
-    def __init__(self, output_file, backup_bad_output=False, backup_dir='/tmp'):
+    def __init__(self, output_file):
         self._output_file = output_file
-        self._backup_bad_output = backup_bad_output
-        self._backup_dir = backup_dir
 
     @abstractmethod
     def fetch_data(self, config) -> Iterable[Dict[str, object]]:
@@ -53,7 +51,7 @@ class Resource(ABC):
 
 class NullResource(Resource):
     def __init__(self):
-        super().__init__(None, False, '/tmp')
+        super().__init__(None)
 
     def fetch_data(self, config) -> Iterable[Dict[str, object]]:
         return []
@@ -67,42 +65,42 @@ class NullResource(Resource):
 
 
 class SimpleCommandResource(Resource):
-    def __init__(self, cmdline, regex, *args, column_names=None, table_output=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cmdline = cmdline
-        if isinstance(regex, (str, bytes)):
-            regex = re.compile(regex)
-        self._regex = regex
+    def __init__(self, output_file, column_names=None, table_output=False, backup_bad_output_dir=None):
+        super().__init__(output_file)
         self._column_names = column_names
         self._table_output = table_output
+        self._backup_bad_output = bool(backup_bad_output_dir)
+        self._backup_dir = backup_bad_output_dir
 
     @property
     def column_names(self):
         if self._column_names is None:
-            self._column_names = ['datetime'] + sorted(self._regex.groupindex.keys(), key=self._regex.groupindex.get)
+            regex = self.make_regex({})
+            self._column_names = ['datetime'] + sorted(regex.groupindex.keys(), key=regex.groupindex.get)
         return self._column_names
 
     def fetch_data(self, config):
-        cmdline = self.customize_cmdline(self._cmdline, config)
+        cmdline = self.make_cmdline(config)
         result = subprocess.run(cmdline, stdout=subprocess.PIPE)
         try:
             yield from self._generic_parse(result.stdout.decode('utf-8'), config)
         except Exception:
-            if self._backup_bad_output:
-                with open(os.path.join(self._backup_dir,
-                                       'bad_{}_{}.txt'.format(cmdline[0], to_local_str(datetime.now()))),
-                          'wb') as bad_file:
+            bad_output_dir = config.get('backup_bad_output_dir')
+            if bad_output_dir:
+                path = os.path.join(bad_output_dir, 'bad_{}_{}.txt'.format(cmdline[0], to_local_str(datetime.now())))
+                with open(path, 'wb') as bad_file:
                     bad_file.write(result.stdout or b'')
 
     def _generic_parse(self, output, config):
         cleaned_output = self.clean_output(output, config)
+        regex = self.make_regex(config)
         if self._table_output:
             info = {'datetime': to_local_str(datetime.now()), 'values': []}
-            for match in self._regex.finditer(cleaned_output):
+            for match in regex.finditer(cleaned_output):
                 res = match.groupdict()
                 info['values'].append(res)
         else:
-            match = self._regex.fullmatch(cleaned_output)
+            match = regex.fullmatch(cleaned_output)
             if match:
                 info = match.groupdict()
             else:
@@ -116,8 +114,14 @@ class SimpleCommandResource(Resource):
     def clean_data(self, info, config):
         yield info
 
-    def customize_cmdline(self, cmdline, config):
-        return cmdline
+    @abstractmethod
+    def make_cmdline(self, config):
+        """Return the command line to run to fetch the data for this configuration."""
+
+    @abstractmethod
+    def make_regex(self, config):
+        """Return the regex to parse the output for this configuration."""
+
 
 
 class NvidiaGpu(SimpleCommandResource):
@@ -148,9 +152,6 @@ class NvidiaGpu(SimpleCommandResource):
         flags=re.VERBOSE
     )
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(['nvidia-smi'], self.NVIDIA_SMI_REGEX, *args, **kwargs)
-
     def clean_output(self, output, config):
         output = re.sub(r'^[+|][+=-]+[|+]\n', '', output, flags=re.MULTILINE)
         output = re.sub(r'^\|\s*', '', output, flags=re.MULTILINE)
@@ -174,6 +175,12 @@ class NvidiaGpu(SimpleCommandResource):
         info['proc_info'] = proc_info
         yield info
 
+    def make_cmdline(self, config):
+        return ['nvidia-smi']
+
+    def make_regex(self, config):
+        return self.NVIDIA_SMI_REGEX
+
 
 class CpuTemps(SimpleCommandResource):
     SENSORS_REGEX = re.compile(
@@ -185,7 +192,7 @@ class CpuTemps(SimpleCommandResource):
     )
 
     def __init__(self, *args, **kwargs):
-        super().__init__(['sensors'], self.SENSORS_REGEX, *args, table_output=True, **kwargs)
+        super().__init__(*args, table_output=True, **kwargs)
 
     def clean_data(self, info, config):
         columns = ('core', 'temp', 'high_temp', 'crit_temp')
@@ -197,6 +204,12 @@ class CpuTemps(SimpleCommandResource):
             row_data = dict.fromkeys(columns, 'N/A')
             row_data['datetime'] = info['datetime']
             yield row_data
+
+    def make_cmdline(self, config):
+        return ['sensors']
+
+    def make_regex(self, config):
+        return self.SENSORS_REGEX
 
 
 class CpuRam(SimpleCommandResource):
@@ -233,9 +246,6 @@ class CpuRam(SimpleCommandResource):
         ''', re.VERBOSE
     )
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(['top', '-n', '1', '-b'], self.TOP_REGEX, *args, **kwargs)
-
     def clean_data(self, info, config):
         """Parses and formats the process information"""
         pid = str(config.get('pid')) if 'pid' in config else None
@@ -259,8 +269,11 @@ class CpuRam(SimpleCommandResource):
         info['proc_info'] = proc_info
         yield info
 
-    def customize_cmdline(self, cmdline, config):
-        return cmdline if config.get('pid') is None else cmdline + ['-p', str(config['pid'])]
+    def make_cmdline(self, config):
+        return ['top', '-n', '1', '-b'] + (['-p', str(config['pid'])] if config.get('pid') is not None else [])
+
+    def make_regex(self, config):
+        return self.TOP_REGEX
 
 
 def parse_interval(interval):
@@ -287,7 +300,7 @@ def _pid_exists(pid):
         return False
 
 
-def run(interval, gpu, temperatures, cpu_and_ram, pid, write_header=True, backup_bad_output=False, backup_dir='/tmp'):
+def run(interval, gpu, temperatures, cpu_and_ram, pid, write_header=True, backup_bad_output_dir=None):
     """Mainloop that calls the `monitor_*` function and then sleeps for `interval` seconds."""
     gpu_config = {'pid': pid}
     cpu_config = {'pid': pid}
@@ -297,20 +310,21 @@ def run(interval, gpu, temperatures, cpu_and_ram, pid, write_header=True, backup
     temps_resource = NullResource()
 
     if gpu:
-        gpu_resource = NvidiaGpu(gpu, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
+        gpu_resource = NvidiaGpu(gpu, backup_bad_output_dir=backup_bad_output_dir)
 
     if cpu_and_ram:
-        cpu_and_ram_resource = CpuRam(cpu_and_ram, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
+        cpu_and_ram_resource = CpuRam(cpu_and_ram, backup_bad_output_dir=backup_bad_output_dir)
 
     if temperatures:
-        temps_resource = CpuTemps(temperatures, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
+        temps_resource = CpuTemps(temperatures, backup_bad_output_dir=backup_bad_output_dir)
 
-    while pid is None or _pid_exists(pid):
-        gpu_resource.monitor(gpu_config, header=write_header)
-        temps_resource.monitor(temps_config, header=write_header)
-        cpu_and_ram_resource.monitor(cpu_config, header=write_header)
-        write_header = False
-        time.sleep(interval)
+    with suppress(KeyboardInterrupt):
+        while pid is None or _pid_exists(pid):
+            gpu_resource.monitor(gpu_config, header=write_header)
+            temps_resource.monitor(temps_config, header=write_header)
+            cpu_and_ram_resource.monitor(cpu_config, header=write_header)
+            write_header = False
+            time.sleep(interval)
 
 
 def _make_parser():
@@ -325,10 +339,8 @@ def _make_parser():
                                help="Don't write error messages to stdout")
     parent_parser.add_argument('--no-header', action='store_false', dest='write_header',
                                help='Do not write the header to the log files when starting.')
-    parent_parser.add_argument('-b', '--backup-bad-output', action='store_true',
-                               help='If the output of the monitoring programs cannot be matched save it.')
-    parent_parser.add_argument('-B', '--backup-dir', default='/tmp',
-                               help='Directory where the backup outputs will be saved')
+    parent_parser.add_argument('-b', '--backup-bad-output-dir', default='/tmp',
+                               help='Directory where the backup outputs will be saved.')
 
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest='command')
@@ -356,8 +368,7 @@ def monitor(args):
         cpu_and_ram=args.cpu_and_ram,
         pid=args.pid,
         write_header=args.write_header,
-        backup_bad_output=args.backup_bad_output,
-        backup_dir=args.backup_dir,
+        backup_bad_output_dir=args.backup_bad_output_dir,
     )
 
 
