@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse
-import atexit
-import datetime as dt
 import os
 import re
-import signal
-import subprocess
 import sys
-import tempfile
 import time
+import atexit
+import signal
+import argparse
+import tempfile
+import subprocess
+import datetime as dt
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from csv import DictWriter
 from datetime import datetime
-from typing import Dict, Union
+from typing import Dict, Iterable, List
+
 
 LOCAL_TIMEZONE = datetime.now(dt.timezone.utc).astimezone().tzinfo
 
@@ -23,145 +26,181 @@ def to_local_str(date: datetime):
     return date.replace(tzinfo=LOCAL_TIMEZONE).strftime('%Y-%m-%dT%H:%M:%S%Z')
 
 
-def parse_nvidia_smi(output, backup_bad_output=False, backup_dir='/tmp'):
-    """Parses the output of the command `nvidia-smi`."""
-    output = re.sub(r'^[+|][+=-]+[|+]\n', '', output, flags=re.MULTILINE)
-    output = re.sub(r'^\|\s*', '', output, flags=re.MULTILINE)
-    output = re.sub(r'\s*\|$', '', output, flags=re.MULTILINE)
-    output = re.sub(r'^\s*\n', '', output, flags=re.MULTILINE)
-    regex = re.compile(
+class Resource(ABC):
+    def __init__(self, output_file, backup_bad_output=False, backup_dir='/tmp'):
+        self._output_file = output_file
+        self._backup_bad_output = backup_bad_output
+        self._backup_dir = backup_dir
+
+    @abstractmethod
+    def fetch_data(self, config) -> Iterable[Dict[str, object]]:
+        """Fetch the data for the resource."""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def column_names(self) -> List[str]:
+        """Return the list of column names"""
+
+    def monitor(self, config, header=True):
+        with open(self._output_file, 'a') as out_file:
+            writer = DictWriter(out_file, self.column_names)
+            if header:
+                writer.writeheader()
+            for data_row in self.fetch_data(config):
+                writer.writerow(data_row)
+
+
+class NullResource(Resource):
+    def __init__(self):
+        super().__init__(None, False, '/tmp')
+
+    def fetch_data(self, config) -> Iterable[Dict[str, object]]:
+        return []
+
+    @property
+    def column_names(self) -> List[str]:
+        return []
+
+    def monitor(self, config, header=True):
+        return
+
+
+class SimpleCommandResource(Resource):
+    def __init__(self, cmdline, regex, *args, column_names=None, table_output=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cmdline = cmdline
+        if isinstance(regex, (str, bytes)):
+            regex = re.compile(regex)
+        self._regex = regex
+        self._column_names = column_names
+        self._table_output = table_output
+
+    @property
+    def column_names(self):
+        if self._column_names is None:
+            self._column_names = ['datetime'] + sorted(self._regex.groupindex.keys(), key=self._regex.groupindex.get)
+        return self._column_names
+
+    def fetch_data(self, config):
+        cmdline = self.customize_cmdline(self._cmdline, config)
+        result = subprocess.run(cmdline, stdout=subprocess.PIPE)
+        try:
+            yield from self._generic_parse(result.stdout.decode('utf-8'), config)
+        except Exception:
+            if self._backup_bad_output:
+                with open(os.path.join(self._backup_dir,
+                                       'bad_{}_{}.txt'.format(cmdline[0], to_local_str(datetime.now()))),
+                          'wb') as bad_file:
+                    bad_file.write(result.stdout or b'')
+
+    def _generic_parse(self, output, config):
+        cleaned_output = self.clean_output(output, config)
+        if self._table_output:
+            info = {'datetime': to_local_str(datetime.now()), 'values': []}
+            for match in self._regex.finditer(cleaned_output):
+                res = match.groupdict()
+                info['values'].append(res)
+        else:
+            match = self._regex.fullmatch(cleaned_output)
+            if match:
+                info = match.groupdict()
+            else:
+                info = dict.fromkeys(self.column_names, 'N/A')
+            info['datetime'] = to_local_str(datetime.now())
+        yield from self.clean_data(info, config)
+
+    def clean_output(self, output, config):
+        return output
+
+    def clean_data(self, info, config):
+        yield info
+
+    def customize_cmdline(self, cmdline, config):
+        return cmdline
+
+
+class NvidiaGpu(SimpleCommandResource):
+    NVIDIA_SMI_REGEX = re.compile(
         r'''
-            (?P<nvidia_datetime>.*)\s*
-        NVIDIA-SMI\s*(?P<nvidia_smi_version>\d+\.\d+)\s*
-            Driver\sVersion:\s*(?P<driver_version>\d+\.\d+)\s*
-            CUDA\sVersion:\s*(?P<cuda_version>\d+\.\d+)\s*
-        GPU\s*Name\s*
-            Persistence-M+\s*\|\s*
-            Bus-Id\s*Disp.A\s*\|\s*
-            Volatile\s*Uncorr.\s*ECC\s*
-        Fan\s* Temp\s* Perf\s* Pwr:Usage/Cap\|\s*
-            Memory-Usage\s*\|\s*
-            GPU-Util\s*Compute\s*M.\s*
-        (?P<gpu_number>\d+)\s* (?P<gpu_name>[\w\s]+(?=\s+\w+\s+))\s+ (?P<persistence_m>\w+)\s* \|\s*
-            (?P<bus_id>\d+:\d+:\d+\.\d+)\s* (?P<disp_a>\w+)\s*\|\s*
-            (?P<ecc>.*\s*)
-        (?P<gpu_fan>\d+[%])\s* (?P<gpu_temp>\d+[C])\s* (?P<gpu_perf>\w+)\s* 
-            (?P<gpu_power_usage>\d+[W])\s* / \s*(?P<gpu_power_cap>\d+[W])\s* \|\s*
-            (?P<gpu_ram_usage>\d+MiB)\s*/\s*(?P<gpu_total_ram>\d+MiB)\s*\|\s*
-            (?P<gpu_util>\d+[%])\s*(?P<compute_m>\w+)\s*
-        Processes:\s*
-        GPU\s* Memory\s* GPU\s* PID\s* Type\s* Process\s* name\s* Usage\s*
-        (?P<proc_info>(?:\n|.)*)
+            .*\s*
+            NVIDIA-SMI\s*(?P<nvidia_smi_version>\d+\.\d+)\s*
+                Driver\sVersion:\s*(?P<driver_version>\d+\.\d+)\s*
+                CUDA\sVersion:\s*(?P<cuda_version>\d+\.\d+)\s*
+            GPU\s*Name\s*
+                Persistence-M+\s*\|\s*
+                Bus-Id\s*Disp.A\s*\|\s*
+                Volatile\s*Uncorr.\s*ECC\s*
+            Fan\s* Temp\s* Perf\s* Pwr:Usage/Cap\|\s*
+                Memory-Usage\s*\|\s*
+                GPU-Util\s*Compute\s*M.\s*
+            (?P<gpu_number>\d+)\s* (?P<gpu_name>[\w\s]+(?=\s+\w+\s+))\s+ (?P<persistence_m>\w+)\s* \|\s*
+                (?P<bus_id>\d+:\d+:\d+\.\d+)\s* (?P<disp_a>\w+)\s*\|\s*
+                (?P<ecc>\S*)\s*
+            (?P<gpu_fan>\d+[%])\s* (?P<gpu_temp>\d+[C])\s* (?P<gpu_perf>\w+)\s* 
+                (?P<gpu_power_usage>\d+[W])\s* / \s*(?P<gpu_power_cap>\d+[W])\s* \|\s*
+                (?P<gpu_ram_usage>\d+MiB)\s*/\s*(?P<gpu_total_ram>\d+MiB)\s*\|\s*
+                (?P<gpu_util>\d+[%])\s*(?P<compute_m>\w+)\s*
+            Processes:\s*
+            GPU\s* Memory\s* GPU\s* PID\s* Type\s* Process\s* name\s* Usage\s*
+            (?P<proc_info>(?:\n|.)*)
         ''',
         flags=re.VERBOSE
     )
-    m = regex.fullmatch(output)
-    if m:
-        info = m.groupdict()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(['nvidia-smi'], self.NVIDIA_SMI_REGEX, *args, **kwargs)
+
+    def clean_output(self, output, config):
+        output = re.sub(r'^[+|][+=-]+[|+]\n', '', output, flags=re.MULTILINE)
+        output = re.sub(r'^\|\s*', '', output, flags=re.MULTILINE)
+        output = re.sub(r'\s*\|$', '', output, flags=re.MULTILINE)
+        return re.sub(r'^\s*\n', '', output, flags=re.MULTILINE)
+
+    def clean_data(self, info, config):
+        """Parses and formats the process information"""
+        pid = str(config.get('pid')) if 'pid' in config else None
         procs = []
-        for line in m.group('proc_info').splitlines():
+        for line in info['proc_info'].splitlines():
             proc_m = re.fullmatch(
                 r'\s*(?P<gpu>\d+)\s*(?P<pid>\d+)\s*(?P<type>\w+)\s*(?P<name>.+)\s+(?P<mem_usage>\d+MiB)\s*',
-                line)
+                line
+            )
             procs.append({k: v.strip() for k, v in proc_m.groupdict().items()})
-        info = {k: v.strip() for k, v in info.items()}
-        info['proc_info'] = procs
-    else:
-        now = datetime.now()
-        if backup_bad_output:
-            with open(os.path.join(backup_dir, 'bad_nvidia_smi_{}.txt'.format(to_local_str(now))), 'w') as bad_file:
-                bad_file.write(output)
-
-        keys_defined = (
-            'nvidia_datetime', 'nvidia_smi_version', 'driver_version', 'cuda_version',
-            'gpu_number', 'gpu_name', 'persistence_m', 'bus_id', 'disp_a', 'ecc',
-            'gpu_fan', 'gpu_temp', 'gpu_perf', 'gpu_power_usage', 'gpu_power_cap', 'gpu_ram_usage', 'gpu_total_ram',
-            'gpu_util', 'compute_m',
+        proc_order = ('pid', 'gpu', 'mem_usage', 'type', 'name')
+        proc_info = '|'.join(
+            ','.join(proc[k] for k in proc_order) for proc in procs if pid is None or proc['pid'] == pid
         )
-        info = dict.fromkeys(keys_defined, 'N/A')
-        info['nvidia_datetime'] = now.replace(tzinfo=LOCAL_TIMEZONE).strftime('%a %b %d %H:%M:%S %Y')
-        info['proc_info'] = []
-    return info
+        info['proc_info'] = proc_info
+        yield info
 
 
-def monitor_gpu(output_file, pid=None, header=False, backup_bad_output=False, backup_dir='/tmp'):
-    """Calls `nvidia-smi` and writes a CSV line to the `output_file`.
-
-    If `header` is true then writes the header line too.
-    If `pid` is not `None` then it should be the pid of a process and only that process information will
-    be saved to the output file.
-
-    """
-    column_order = (
-        'datetime',
-        'nvidia_smi_version', 'driver_version', 'cuda_version',
-        'gpu_number', 'gpu_name', 'persistence_m', 'bus_id', 'disp_a', 'ecc',
-        'gpu_fan', 'gpu_temp', 'gpu_perf', 'gpu_power_usage', 'gpu_power_cap', 'gpu_ram_usage', 'gpu_total_ram',
-        'gpu_util', 'compute_m',
-        'proc_info',
+class CpuTemps(SimpleCommandResource):
+    SENSORS_REGEX = re.compile(
+        r'''
+            (?P<core>Core\s+\d+):\s*(?P<temp>[-+]?\d+\.\d+°C)\s*
+            \(high\s*=\s*(?P<high_temp>[-+]?\d+\.\d+°C),\s*crit\s*=\s*(?P<crit_temp>[-+]?\d+\.\d+°C)\)
+        ''',
+        re.VERBOSE
     )
-    proc_order = ('pid', 'gpu', 'mem_usage', 'type', 'name')
-    with open(output_file, 'a') as out:
-        if header:
-            out.write(';'.join(column_order) + '\n')
-        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE)
-        res = parse_nvidia_smi(result.stdout.decode('utf-8'), backup_bad_output, backup_dir)
-        res['datetime'] = to_local_str(datetime.strptime(res.pop('nvidia_datetime'), '%a %b %d %H:%M:%S %Y'))
-        if pid is not None:
-            procs = [v for v in res['proc_info'] if v['pid'] == str(pid)]
-        else:
-            procs = res['proc_info']
-        res['proc_info'] = '|'.join(','.join(proc[k] for k in proc_order) for proc in procs)
-        out.write(';'.join(res[k] for k in column_order) + '\n')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(['sensors'], self.SENSORS_REGEX, *args, table_output=True, **kwargs)
+
+    def clean_data(self, info, config):
+        columns = ('core', 'temp', 'high_temp', 'crit_temp')
+        for value in info['values']:
+            row_data = {col: value[col] for col in columns}
+            row_data['datetime'] = info['datetime']
+            yield row_data
+        if not info['values']:
+            row_data = dict.fromkeys(columns, 'N/A')
+            row_data['datetime'] = info['datetime']
+            yield row_data
 
 
-def parse_sensors(output, backup_bad_output=False, backup_dir='/tmp'):
-    """Parses the output of the `sensors` command."""
-    matches = re.finditer(
-        r'(?P<core>Core \d+):\s*(?P<temp>[-+]?\d+\.\d+°C)\s*'
-        r'\(high = (?P<high_temp>[-+]?\d+\.\d+°C), crit = (?P<crit_temp>[-+]?\d+\.\d+°C)\)',
-        output
-    )
-    res = {}
-    for match in matches:
-        res[match.group('core')] = {
-            'temp': match['temp'], 'high_temp': match['high_temp'], 'crit_temp': match['crit_temp']
-        }
-    if not res:
-        now = datetime.now()
-        if backup_bad_output:
-            with open(os.path.join(backup_dir, 'bad_sensors_{}.txt'.format(to_local_str(now))), 'w') as bad_file:
-                bad_file.write(output)
-
-        keys_defined = (
-            'temp', 'high_temp', 'crit_temp',
-        )
-        core_info = dict.fromkeys(keys_defined, 'N/A')
-        return {'core N/A': core_info}
-    return res
-
-
-def monitor_cpu_temps(output_file, header=False, backup_bad_output=False, backup_dir='/tmp'):
-    """Executes the `sensors` command and saves a csv line to `output_file`.
-
-    If `header` is true also writes the header to the file.
-
-    """
-    column_order = ('datetime', 'core', 'temp', 'high_temp', 'crit_temp')
-    core_order = column_order[2:]
-    with open(output_file, 'a') as out:
-        if header:
-            out.write(';'.join(column_order) + '\n')
-        result = subprocess.run(['sensors'], stdout=subprocess.PIPE)
-        res = parse_sensors(result.stdout.decode('utf-8'), backup_bad_output, backup_dir)
-        timestamp = to_local_str(datetime.now())
-        for core, values in res.items():
-            out.write('{};{};{}\n'.format(timestamp, core, ';'.join(values[k] for k in core_order)))
-
-
-def parse_top(output: str, backup_bad_output=False, backup_dir='/tmp') -> Dict[str, Union[str, Dict[str, str]]]:
-    """Parses the output of the `top` command."""
-    regex = re.compile(
+class CpuRam(SimpleCommandResource):
+    TOP_REGEX = re.compile(
         r'''
             top\s*-\s*(?P<time>\d+:\d+:\d+)\s*
                 up\s*(?P<uptime>[^,]+),\s*
@@ -191,68 +230,37 @@ def parse_top(output: str, backup_bad_output=False, backup_dir='/tmp') -> Dict[s
                 (?P<swap_used>\d+)\s*used.\s*
                 (?P<avail>\d+)\s*avail\s*Mem\s*.*\s*
             (?P<proc_info>(?:.|\n)+)
-        ''',
-        re.VERBOSE
+        ''', re.VERBOSE
     )
-    m = regex.fullmatch(output)
-    if m:
-        res = m.groupdict()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(['top', '-n', '1', '-b'], self.TOP_REGEX, *args, **kwargs)
+
+    def clean_data(self, info, config):
+        """Parses and formats the process information"""
+        pid = str(config.get('pid')) if 'pid' in config else None
         procs = []
-        for line in res['proc_info'].splitlines():
-            proc_res = re.fullmatch(
+        for line in info['proc_info'].splitlines():
+            proc_m = re.fullmatch(
                 r'\s*(?P<pid>\S+)\s*(?P<user>\S+)\s*(?P<priority>\S+)\s*(?P<nice>\S+)\s*'
                 r'(?P<virtual_mem>\S+)\s*(?P<res_mem>\S+)\s*(?P<shared_mem>\S+)\s*\S+\s*'
                 r'(?P<perc_cpu>[\d,]+)\s*(?P<perc_mem>[\d,]+)\s*'
                 r'(?P<uptime>\S+)\s*(?P<command>.*)\s*',
                 line
             )
-            procs.append(proc_res.groupdict())
-        res['proc_info'] = procs
-    else:
-        now = datetime.now()
-        if backup_bad_output:
-            with open(os.path.join(backup_dir, 'bad_top_{}.txt'.format(to_local_str(now))), 'w') as bad_file:
-                bad_file.write(output)
-
-        keys_defined = (
-            'time', 'uptime', 'num_users', 'load_avg_1', 'load_avg_2', 'load_avg_3',
-            'num_tasks', 'num_running_tasks', 'num_sleeping_tasks', 'num_stopped_tasks', 'num_zombie_tasks',
-            'user_cpu', 'system_cpu', 'ni_cpu', 'id_cpu', 'wa_cpu', 'hi_cpu', 'si_cpu', 'st_cpu',
-            'ram_unit', 'ram_total', 'free_ram', 'used_ram', 'ram_buff_cache',
-            'swap_unit', 'swap_total', 'swap_free', 'swap_used', 'avail'
+            procs.append(proc_m.groupdict())
+        proc_order = (
+            'pid', 'perc_cpu', 'perc_mem', 'uptime', 'user', 'priority', 'nice', 'virtual_mem', 'res_mem',
+            'shared_mem', 'command',
         )
-        res = dict.fromkeys(keys_defined, 'N/A')
-        res['proc_info'] = []
-    return res
+        proc_info = '|'.join(
+            ','.join(proc[k] for k in proc_order) for proc in procs if pid is None or proc['pid'] == pid
+        )
+        info['proc_info'] = proc_info
+        yield info
 
-
-def monitor_top(output_file, pid=None, header=False, backup_bad_output=False, backup_dir='/tmp'):
-    """Runs the `top` command and saves a CSV line with the information to `output_file`.
-
-    If `header` is true the header is also written to `output_file`.
-    If `pid` is specified then only information regarding that PID is saved.
-
-    """
-    column_order = (
-        'datetime',
-        'uptime', 'num_users', 'load_avg_1', 'load_avg_2', 'load_avg_3',
-        'num_tasks', 'num_running_tasks', 'num_sleeping_tasks', 'num_stopped_tasks', 'num_zombie_tasks',
-        'user_cpu', 'system_cpu',
-        'ram_unit', 'ram_total', 'free_ram', 'used_ram', 'ram_buff_cache',
-        'swap_unit', 'swap_total', 'swap_free', 'swap_used', 'avail',
-        'proc_info',
-    )
-    proc_order = ('pid', 'user', 'perc_cpu', 'perc_mem', 'virtual_mem', 'res_mem', 'shared_mem', 'uptime', 'command')
-    with open(output_file, 'a') as out:
-        if header:
-            out.write(';'.join(column_order) + '\n')
-        result = subprocess.run(['top', '-n', '1', '-b'] + ([] if pid is None else ['-p', str(pid)]),
-                                stdout=subprocess.PIPE)
-        res = parse_top(result.stdout.decode('utf-8'), backup_bad_output, backup_dir)
-        res['datetime'] = to_local_str(datetime.now())
-        # noinspection PyTypeChecker
-        res['proc_info'] = '|'.join(','.join(proc[k] for k in proc_order) for proc in res['proc_info'])
-        out.write(';'.join(res[k] for k in column_order) + '\n' + '\n')
+    def customize_cmdline(self, cmdline, config):
+        return cmdline if config.get('pid') is None else cmdline + ['-p', str(config['pid'])]
 
 
 def parse_interval(interval):
@@ -281,13 +289,26 @@ def _pid_exists(pid):
 
 def run(interval, gpu, temperatures, cpu_and_ram, pid, write_header=True, backup_bad_output=False, backup_dir='/tmp'):
     """Mainloop that calls the `monitor_*` function and then sleeps for `interval` seconds."""
+    gpu_config = {'pid': pid}
+    cpu_config = {'pid': pid}
+    temps_config = {}
+    gpu_resource = NullResource()
+    cpu_and_ram_resource = NullResource()
+    temps_resource = NullResource()
+
+    if gpu:
+        gpu_resource = NvidiaGpu(gpu, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
+
+    if cpu_and_ram:
+        cpu_and_ram_resource = CpuRam(cpu_and_ram, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
+
+    if temperatures:
+        temps_resource = CpuTemps(temperatures, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
+
     while pid is None or _pid_exists(pid):
-        if gpu:
-            monitor_gpu(gpu, pid, write_header, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
-        if temperatures:
-            monitor_cpu_temps(temperatures, write_header, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
-        if cpu_and_ram:
-            monitor_top(cpu_and_ram, pid, write_header, backup_bad_output=backup_bad_output, backup_dir=backup_dir)
+        gpu_resource.monitor(gpu_config, header=write_header)
+        temps_resource.monitor(temps_config, header=write_header)
+        cpu_and_ram_resource.monitor(cpu_config, header=write_header)
         write_header = False
         time.sleep(interval)
 
