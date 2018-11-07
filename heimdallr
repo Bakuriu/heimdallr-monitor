@@ -446,12 +446,18 @@ def create_gentle_killer(proc, verbose):
         """Kills the process group `victim_id` and then terminates the current process with exit code 1."""
         # try with SIGTERM
         try:
-            log("Killing background task gently...")
+            log("Killing background task gently. ")
             try:
                 os.killpg(victim_id, signal.SIGTERM)
                 if proc.poll() is None:
-                    log("Waiting 5 seconds.\n")
-                    time.sleep(5)
+                    log("Waiting up to 5 seconds ")
+                    for i in range(25):
+                        time.sleep(0.2)
+                        if i % 5 == 0:
+                            log('.')
+                        if proc.poll() is not None:
+                            log(' Process completed.\n')
+                            break
                 else:
                     log("Task killed.\n")
             except Exception as e:
@@ -470,7 +476,7 @@ def create_gentle_killer(proc, verbose):
                     )
                     log(msg.format(e, proc_pid))
         finally:
-            log('Exiting main process.')
+            log('Exiting main process.\n')
             sys.exit(1)
 
     return kill_gently
