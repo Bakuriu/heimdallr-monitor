@@ -483,11 +483,15 @@ def create_gentle_killer(proc, verbose):
 
 
 def main():
-    args = _make_parser().parse_args()
+    parser = _make_parser()
+    args = parser.parse_args()
     if args.command == 'launch':
         launch(args)
-    else:
+    elif args.command == 'monitor':
         monitor(args)
+    else:
+        parser.error('You must select a sub-command to run.')
+
 
 
 if __name__ == '__main__':
