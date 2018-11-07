@@ -7,16 +7,15 @@ import sys
 import time
 import atexit
 import signal
-import argparse
 import tempfile
+import argparse
 import subprocess
 import datetime as dt
-from abc import ABC, abstractmethod
-from contextlib import contextmanager, suppress
 from csv import DictWriter
 from datetime import datetime
+from abc import ABC, abstractmethod
 from typing import Dict, Iterable, List
-
+from contextlib import contextmanager, suppress
 
 LOCAL_TIMEZONE = datetime.now(dt.timezone.utc).astimezone().tzinfo
 
@@ -32,6 +31,7 @@ class Resource(ABC):
     All resources need to define the output file where the CSV will be saved.
 
     """
+
     def __init__(self, output_file):
         self._output_file = output_file
 
@@ -67,6 +67,7 @@ class Resource(ABC):
 
 class NullResource(Resource):
     """A null resource. This is use as a placeholder when no resource is given."""
+
     def __init__(self):
         super().__init__(None)
 
@@ -104,6 +105,7 @@ class SimpleCommandResource(Resource):
     the addition of the special column `datetime` which will always contain the current time.
 
     """
+
     def __init__(self, output_file, table_output=False):
         super().__init__(output_file)
         self._column_names = None
@@ -131,18 +133,16 @@ class SimpleCommandResource(Resource):
         """
         cmdline = self.make_cmdline(config)
         result = subprocess.run(cmdline, stdout=subprocess.PIPE)
-        try:
-            yield from self._generic_parse(result.stdout.decode('utf-8'), config)
-        except Exception:
-            self._backup_output(cmdline[0], config.get('backup_bad_output_dir'), result)
+        yield from self._generic_parse(result.stdout.decode('utf-8'), config, cmdline[0])
 
-    def _backup_output(self, command_name, bad_output_dir, result):
+    @staticmethod
+    def _backup_output(command_name, bad_output_dir, output):
         if bad_output_dir:
             path = os.path.join(bad_output_dir, 'bad_{}_{}.txt'.format(command_name, to_local_str(datetime.now())))
             with open(path, 'wb') as bad_file:
-                bad_file.write(result.stdout or b'')
+                bad_file.write(output.encode('utf-8') or b'')
 
-    def _generic_parse(self, output, config):
+    def _generic_parse(self, output, config, command_name='command'):
         cleaned_output = self.clean_output(output, config)
         regex = self.make_regex(config)
         if self._table_output:
@@ -150,12 +150,15 @@ class SimpleCommandResource(Resource):
             for match in regex.finditer(cleaned_output):
                 res = match.groupdict()
                 info['values'].append(res)
+            if not info['values']:
+                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
         else:
             match = regex.fullmatch(cleaned_output)
             if match:
                 info = match.groupdict()
             else:
                 info = dict.fromkeys(self.column_names, 'N/A')
+                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
             info['datetime'] = to_local_str(datetime.now())
         yield from self.clean_data(info, config)
 
@@ -180,7 +183,6 @@ class SimpleCommandResource(Resource):
     @abstractmethod
     def make_regex(self, config):
         """Return the regex to parse the output for this configuration."""
-
 
 
 class NvidiaGpu(SimpleCommandResource):
@@ -579,7 +581,6 @@ def main():
         monitor(args)
     else:
         parser.error('You must select a sub-command to run.')
-
 
 
 if __name__ == '__main__':
