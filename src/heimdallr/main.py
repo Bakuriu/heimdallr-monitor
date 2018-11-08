@@ -160,21 +160,19 @@ def launch(args, plugins):
 
 
 def main():
-    from .plugins import nvidia_smi, cpu_temperatures, top
-    plugins = {
-        'nvidia_smi': nvidia_smi,
-        'cpu_temperatures': cpu_temperatures,
-        'top': top,
-    }
+    from . import plugins as builtin_plugins
+    plugins = {mod_name: getattr(builtin_plugins, mod_name) for mod_name in builtin_plugins.__all__}
     try:
-        # FIXME: a bad plugin should not prevent loading all the rest...
         import pkg_resources
-        plugins.update({
-            entry_point.name: entry_point.load()
-            for entry_point in pkg_resources.iter_entry_points('heimdallr.plugins')
-        })
     except ImportError:
+        # no setuptools. Plugins are not supported.
         pass
+    else:
+        for entry_point in pkg_resources.iter_entry_points('heimdallr.plugins'):
+            try:
+                plugins[entry_point.name] = entry_point.load()
+            except ImportError:
+                pass
 
     for mod in list(plugins.values()):
         for alias in getattr(mod, 'aliases', ()):

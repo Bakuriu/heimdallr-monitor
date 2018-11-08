@@ -3,7 +3,7 @@ import subprocess
 from abc import ABC, abstractmethod
 from csv import DictWriter
 from datetime import datetime
-from typing import Iterable, Dict, List
+from typing import Iterable, Dict, List, Tuple
 
 from .utils import to_local_str
 
@@ -69,7 +69,7 @@ class NullResource(Resource):
 
 
 class SimpleCommandResource(Resource):
-    """Base class for resources that are defined by running a single command and parsing its result.
+    """Base class for resources that are defined by running a single command and parsing its result with a regex.
 
     Most resources fall into this simple category.
 
@@ -166,3 +166,100 @@ class SimpleCommandResource(Resource):
     @abstractmethod
     def make_regex(self, config):
         """Return the regex to parse the output for this configuration."""
+
+
+class MultiCommandResource(Resource):
+    """Base class for resources that are defined by running multiple commands and parsing their result with a regex.
+
+    Subclasses of this class must define at least four methods:
+     - `column_names`
+     - `make_cmdlines`
+     - `make_regexes`
+     - `combine_results`
+
+    The `column_names` property should return the header file for the CSV.
+
+    The `make_cmdlines` method returns an iterable of list of strings, that are used as command lines.
+
+    The `make_regexes` should return an iterable of pairs whose first element is a regex object, that can be used to
+    parse the output of the corresponding command, and a boolean indicating wheter or not the output is "tabled".
+
+    The `combine_results` should take the list of parsed results from the various commands and generate an iterable
+    of dicts containing the data to be written to the logfile.
+
+    """
+
+    def __init__(self, output_file):
+        super().__init__(output_file)
+        self._column_names = None
+
+    def fetch_data(self, config):
+        """Fetches the data from the command returned by `make_cmdline`.
+
+        The `config` argument may contain the `backup_bad_output_dir` parameter.
+        If specified, it should be the path to a directory in which we can
+        save files containing the output of the commands run. These outputs will be created whenever parsing
+        using the regex fails.
+        This behaviour is useful in two instances:
+         - to debug the regex during development
+         - to avoid losing data in unexpected circumstances in production
+        By default no output is saved.
+
+        """
+        results = []
+        for cmdline, (regex, table_output) in zip(self.make_cmdlines(config), self.make_regexes(config)):
+            result = subprocess.run(cmdline, stdout=subprocess.PIPE).stdout.decode('utf-8')
+            results.append(self._generic_parse(result, config, regex, table_output, command_name=cmdline[0]))
+        yield from self.combine_results(results, config)
+
+    @staticmethod
+    def _backup_output(command_name, bad_output_dir, output):
+        if bad_output_dir:
+            path = os.path.join(bad_output_dir, 'bad_{}_{}.txt'.format(command_name, to_local_str(datetime.now())))
+            with open(path, 'wb') as bad_file:
+                bad_file.write(output.encode('utf-8') or b'')
+
+    def _generic_parse(self, output, config, regex, table_output, command_name='command'):
+        cleaned_output = self.clean_output(output, command_name, config)
+        if table_output:
+            info = {'datetime': to_local_str(datetime.now()), 'values': []}
+            for match in regex.finditer(cleaned_output):
+                res = match.groupdict()
+                info['values'].append(res)
+            if not info['values']:
+                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
+        else:
+            match = regex.fullmatch(cleaned_output)
+            if match:
+                info = match.groupdict()
+            else:
+                info = dict.fromkeys(self.column_names, 'N/A')
+                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
+            info['datetime'] = to_local_str(datetime.now())
+        return info
+
+    def clean_output(self, output, command_name, config):
+        """This method should return clean `output` and return a string that will be matched
+        with the regex.
+
+        """
+        return output
+
+    @abstractmethod
+    def make_cmdlines(self, config):
+        """Return the command lines to run to fetch the data for this configuration.
+
+        Each element of the returned iterable shall be a pair `(cmdline, table_output)` where
+        `cmdline` is a list of strings that can be used as a command line while `table_output` is a
+        boolean. If `table_output` is `False` the output of `cmdline` will be parsed using the `fullmatch` method,
+        while if `table_outut` is `True` the `finditer` method will be used instead.
+
+        """
+
+    @abstractmethod
+    def make_regexes(self, config):
+        """Return the regex to parse the output for this configuration."""
+
+    @abstractmethod
+    def combine_results(self, results, config):
+        """Combine the parsed results of the different commands."""
