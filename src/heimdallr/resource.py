@@ -3,7 +3,7 @@ import subprocess
 from abc import ABC, abstractmethod
 from csv import DictWriter
 from datetime import datetime
-from typing import Iterable, Dict, List, Tuple
+from typing import Iterable, Dict, List, Tuple, Set
 
 from .utils import to_local_str
 
@@ -40,12 +40,24 @@ class Resource(ABC):
         should be done inside the `fetch_data` method.
 
         """
+        missing_options = self.required_options() - config.keys()
+        if missing_options:
+            raise ValueError('You must provide a value for options: {}'.format(', '.join(missing_options)))
         with open(self._output_file, 'a') as out_file:
             writer = DictWriter(out_file, self.column_names)
             if header:
                 writer.writeheader()
             for data_row in self.fetch_data(config):
                 writer.writerow(data_row)
+
+    @classmethod
+    def required_options(cls) -> Set[str]:
+        """Returns a set of options that must be present in the configuration for the resource.
+
+        By default no option is required.
+
+        """
+        return set()
 
 
 class NullResource(Resource):
