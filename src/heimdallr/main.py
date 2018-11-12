@@ -39,10 +39,7 @@ def parse_configuration_file(config_file):
         configuration = {}
         resources = parser.sections()
         for resource in resources:
-            config = {key: parser.get(resource, key) for key in parser[resource]}
-            if 'logfile' not in config:
-                raise ValueError('You must specify a logfile for resource: {!r}'.format(resource))
-            configuration[resource] = config
+            configuration[resource] = {key: _parse_value(parser.get(resource, key)) for key in parser[resource]}
         return configuration
 
 
@@ -237,10 +234,10 @@ def main():
             configuration[resource] = {
                 'logfile': logfile,
             }
-
-    print('configuration', configuration)
-
-    print('global_configuration', global_config)
+    else:
+        for resource, resource_config in configuration.items():
+            if 'logfile' not in resource_config:
+                sys.exit('You must specify logfile parameter for resource {!r}'.format(resource))
 
     if args.command == 'launch':
         global_config.update({
