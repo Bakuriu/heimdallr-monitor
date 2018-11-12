@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import os
 import re
+import ast
 import sys
 import time
 import atexit
@@ -30,17 +30,48 @@ def parse_interval(interval):
     return float(match[1]) * ({'s': 1, 'm': 60, 'h': 60 * 60}[match[2]])
 
 
-def parse_configuration(config_file):
-    parser = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
-    parser.read_file(config_file)
-    configuration = {}
-    resources = parser.sections()
-    for resource in resources:
-        config = {key: parser.get(resource, key) for key in parser[resource]}
-        if 'logfile' not in config:
-            raise ValueError('You must specify a logfile for resource: {!r}'.format(resource))
-        configuration['resource'] = config
-    return configuration
+def parse_configuration_file(config_file):
+    if config_file is None:
+        return {}
+    with open(config_file) as config:
+        parser = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
+        parser.read_file(config)
+        configuration = {}
+        resources = parser.sections()
+        for resource in resources:
+            config = {key: parser.get(resource, key) for key in parser[resource]}
+            if 'logfile' not in config:
+                raise ValueError('You must specify a logfile for resource: {!r}'.format(resource))
+            configuration[resource] = config
+        return configuration
+
+
+def parse_configuration_string(config_string):
+    """Parse a configuration string.
+
+    The format of the string should be:
+
+        <RESOURCE-NAME> ':' <OPTION-NAME>=<OPTION-VALUE> ',' <OPTION-NAME>=<OPTION-VALUE> <NEWLINE>
+    """
+    config = {}
+    for row in config_string.splitlines():
+        resource, options_values = row.split(':', maxsplit=1)
+        options_matches = re.finditer(r'(?P<key>[^=]+)=(?P<value>"([^"]+(\\")?)+"|[^,]+)(,|$)', options_values)
+        print('splitted_options', options_matches)
+        options = {match['key'].strip(): _parse_value(match['value']) for match in options_matches}
+        config[resource] = options
+    return config
+
+
+def _parse_value(value):
+    value = value.strip()
+    for function in (ast.literal_eval, parse_interval):
+        try:
+            return function(value)
+        except Exception:
+            pass
+    return value
+
 
 
 def run(configuration, global_configuration, plugins):
@@ -63,8 +94,10 @@ def run(configuration, global_configuration, plugins):
 
 def _make_parser():
     parent_parser = argparse.ArgumentParser(add_help=False)
-    parent_parser.add_argument('-c', '--config', type=argparse.FileType('r'), default=None,
+    parent_parser.add_argument('-f', '--config-file', type=parse_configuration_file, default={},
                                help='A configuration file.')
+    parent_parser.add_argument('-c', '--config', type=parse_configuration_string, default={},
+                               help='A configuration string.')
     parent_parser.add_argument('-i', '--interval', type=parse_interval, default='30s',
                                help='Interval between measurements.\nSyntax is: \d+(\.\d+)?(s|m|h).')
     parent_parser.add_argument('-r', '--resource', nargs=2, metavar=('NAME', 'LOGFILE'), action='append', default=[],
@@ -150,7 +183,7 @@ def launch(configuration, global_configuration, plugins):
                         if verbose:
                             sys.stderr.write('Background task has PID: {}\n'.format(global_configuration['pid']))
         except Exception as e:
-            if 'pid' in global_configuration:
+            if global_configuration.get('pid') is not None:
                 # probably an issue with deleting the temporary file?
                 sys.stderr.write('Error after starting background task.\n{0.__class__.__name__}: {0}'.format(e))
             else:
@@ -186,22 +219,29 @@ def main():
     parser = _make_parser()
     args = parser.parse_args()
     global_config = {
-        'pid': args.pid,
-        'backup_bad_output': args.backup_bad_output,
+        'pid': getattr(args, 'pid', None),
+        'backup_bad_output': args.backup_bad_output_dir,
         'interval': args.interval,
         'write_header': args.write_header,
         'verbose': args.verbose,
+        'resources': {}
     }
-    if args.config is not None:
-        configuration = parse_configuration(args.config)
-        global_config_file = configuration.get('global_configuration', {})
-        global_config.update(global_config_file)
-    else:
-        configuration = {}
+    configuration = args.config_file.copy()
+    global_config.update(configuration.pop('global_configuration', {}))
+
+    global_config.update(args.config.pop('global_configuration', {}))
+    configuration.update(args.config)
+
+    if not configuration:
         for resource, logfile in args.resources:
             configuration[resource] = {
                 'logfile': logfile,
             }
+
+    print('configuration', configuration)
+
+    print('global_configuration', global_config)
+
     if args.command == 'launch':
         global_config.update({
             'keep_alive': args.keep_alive,
