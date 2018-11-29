@@ -5,11 +5,12 @@ with open("README.md", "r") as fh:
 
 setup(
     name='heimdallr',
-    version='0.2.0',
+    version='0.3.0',
     author='Giacomo Alzetta',
     author_email='giacomo.alzetta+heimdallr@gmail.com',
     packages=find_packages('src'),
     package_dir={'': 'src'},
+    install_requires=['curio'],
     license='MIT',
     description='Monitor CPU,GPU,RAM & temperatures of the system or a process',
     long_description=long_description,

@@ -1,11 +1,12 @@
 import os
 import subprocess
 from abc import ABC, abstractmethod
-from csv import DictWriter
 from datetime import datetime
-from typing import Iterable, Dict, List, Tuple, Set
+from typing import Iterable, Dict, List, Set
 
-from .utils import to_local_str
+import curio.subprocess
+
+from .utils import to_local_str, AsyncDictCsvWriter
 
 
 class Resource(ABC):
@@ -19,7 +20,7 @@ class Resource(ABC):
         self._output_file = output_file
 
     @abstractmethod
-    def fetch_data(self, config) -> Iterable[Dict[str, object]]:
+    async def fetch_data(self, config):
         """Fetch the data for the resource.
 
         This method should return an iterable that yields dict items containing the data to save to the CSV file.
@@ -33,7 +34,7 @@ class Resource(ABC):
     def column_names(self) -> List[str]:
         """Return the list of column names."""
 
-    def monitor(self, config, header=True):
+    async def monitor(self, config, header=True):
         """Monitors the resource.
 
         This method should NOT be overridden by subclasses. All the logic for fetching, parsing and combining data
@@ -43,12 +44,13 @@ class Resource(ABC):
         missing_options = self.required_options() - config.keys()
         if missing_options:
             raise ValueError('You must provide a value for options: {}'.format(', '.join(missing_options)))
-        with open(self._output_file, 'a') as out_file:
-            writer = DictWriter(out_file, self.column_names)
+        async with curio.file.aopen(self._output_file, 'a') as out_file:
+            writer = AsyncDictCsvWriter(out_file, self.column_names)
             if header:
-                writer.writeheader()
-            for data_row in self.fetch_data(config):
-                writer.writerow(data_row)
+                await writer.writeheader()
+            # noinspection PyTypeChecker
+            async for row in self.fetch_data(config):
+                await writer.writerow(row)
 
     @classmethod
     def required_options(cls) -> Set[str]:
@@ -66,7 +68,7 @@ class NullResource(Resource):
     def __init__(self):
         super().__init__(None)
 
-    def fetch_data(self, config) -> Iterable[Dict[str, object]]:
+    async def fetch_data(self, config) -> Iterable[Dict[str, object]]:
         """Returns an empty iterable."""
         return []
 
@@ -77,7 +79,6 @@ class NullResource(Resource):
 
     def monitor(self, config, header=True):
         """Does nothing."""
-        return
 
 
 class SimpleCommandResource(Resource):
@@ -113,7 +114,7 @@ class SimpleCommandResource(Resource):
             self._column_names = ['datetime'] + sorted(regex.groupindex.keys(), key=regex.groupindex.get)
         return self._column_names
 
-    def fetch_data(self, config):
+    async def fetch_data(self, config):
         """Fetches the data from the command returned by `make_cmdline`.
 
         The `config` argument may contain the `backup_bad_output_dir` parameter.
@@ -127,17 +128,18 @@ class SimpleCommandResource(Resource):
 
         """
         cmdline = self.make_cmdline(config)
-        result = subprocess.run(cmdline, stdout=subprocess.PIPE)
-        yield from self._generic_parse(result.stdout.decode('utf-8'), config, cmdline[0])
+        result = await curio.subprocess.run(cmdline, stdout=subprocess.PIPE)
+        async for data in self._generic_parse(result.stdout.decode('utf-8'), config, cmdline[0]):
+            yield data
 
     @staticmethod
-    def _backup_output(command_name, bad_output_dir, output):
+    async def _backup_output(command_name, bad_output_dir, output):
         if bad_output_dir:
             path = os.path.join(bad_output_dir, 'bad_{}_{}.txt'.format(command_name, to_local_str(datetime.now())))
-            with open(path, 'wb') as bad_file:
-                bad_file.write(output.encode('utf-8') or b'')
+            with curio.file.aopen(path, 'wb') as bad_file:
+                await bad_file.write(output.encode('utf-8') or b'')
 
-    def _generic_parse(self, output, config, command_name='command'):
+    async def _generic_parse(self, output, config, command_name='command'):
         cleaned_output = self.clean_output(output, config)
         regex = self.make_regex(config)
         if self._table_output:
@@ -146,16 +148,17 @@ class SimpleCommandResource(Resource):
                 res = match.groupdict()
                 info['values'].append(res)
             if not info['values']:
-                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
+                await self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
         else:
             match = regex.fullmatch(cleaned_output)
             if match:
                 info = match.groupdict()
             else:
                 info = dict.fromkeys(self.column_names, 'N/A')
-                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
+                await self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
             info['datetime'] = to_local_str(datetime.now())
-        yield from self.clean_data(info, config)
+        for data in self.clean_data(info, config):
+            yield data
 
     def clean_output(self, output, config):
         """This method should return clean `output` and return a string that will be matched
@@ -205,7 +208,7 @@ class MultiCommandResource(Resource):
         super().__init__(output_file)
         self._column_names = None
 
-    def fetch_data(self, config):
+    async def fetch_data(self, config):
         """Fetches the data from the command returned by `make_cmdline`.
 
         The `config` argument may contain the `backup_bad_output_dir` parameter.
@@ -220,18 +223,19 @@ class MultiCommandResource(Resource):
         """
         results = []
         for cmdline, (regex, table_output) in zip(self.make_cmdlines(config), self.make_regexes(config)):
-            result = subprocess.run(cmdline, stdout=subprocess.PIPE).stdout.decode('utf-8')
-            results.append(self._generic_parse(result, config, regex, table_output, command_name=cmdline[0]))
-        yield from self.combine_results(results, config)
+            result = (await curio.subprocess.run(cmdline, stdout=subprocess.PIPE)).stdout.decode('utf-8')
+            results.append(await self._generic_parse(result, config, regex, table_output, command_name=cmdline[0]))
+        for data in self.combine_results(results, config):
+            yield data
 
     @staticmethod
-    def _backup_output(command_name, bad_output_dir, output):
+    async def _backup_output(command_name, bad_output_dir, output):
         if bad_output_dir:
             path = os.path.join(bad_output_dir, 'bad_{}_{}.txt'.format(command_name, to_local_str(datetime.now())))
-            with open(path, 'wb') as bad_file:
-                bad_file.write(output.encode('utf-8') or b'')
+            with curio.file.aopen(path, 'wb') as bad_file:
+                await bad_file.write(output.encode('utf-8') or b'')
 
-    def _generic_parse(self, output, config, regex, table_output, command_name='command'):
+    async def _generic_parse(self, output, config, regex, table_output, command_name='command'):
         cleaned_output = self.clean_output(output, command_name, config)
         if table_output:
             info = {'datetime': to_local_str(datetime.now()), 'values': []}
@@ -239,14 +243,14 @@ class MultiCommandResource(Resource):
                 res = match.groupdict()
                 info['values'].append(res)
             if not info['values']:
-                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
+                await self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
         else:
             match = regex.fullmatch(cleaned_output)
             if match:
                 info = match.groupdict()
             else:
                 info = dict.fromkeys(self.column_names, 'N/A')
-                self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
+                await self._backup_output(command_name, config.get('backup_bad_output_dir'), output)
             info['datetime'] = to_local_str(datetime.now())
         return info
 
