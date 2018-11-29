@@ -215,6 +215,9 @@ def main():
 
     parser = _make_parser()
     args = parser.parse_args()
+    if not args.command:
+        parser.error("You must specify either launch or monitor.")
+
     global_config = {
         'pid': getattr(args, 'pid', None),
         'backup_bad_output': args.backup_bad_output_dir,
