@@ -10,6 +10,7 @@ setup(
     author_email='giacomo.alzetta+heimdallr@gmail.com',
     packages=find_packages('src'),
     package_dir={'': 'src'},
+    python_requires='>=3.5,<4',
     license='MIT',
     description='Monitor CPU,GPU,RAM & temperatures of the system or a process',
     long_description=long_description,
