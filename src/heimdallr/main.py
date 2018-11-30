@@ -4,13 +4,14 @@ import os
 import re
 import ast
 import sys
-import time
 import atexit
 import signal
 import argparse
 import subprocess
 import configparser
 from contextlib import suppress
+
+import curio
 
 from .utils import _pid_exists, name_of_temporary_file, create_gentle_killer
 
@@ -71,7 +72,7 @@ def _parse_value(value):
 
 
 
-def run(configuration, global_configuration, plugins):
+async def run(configuration, global_configuration, plugins):
     """Mainloop that calls the `monitor_*` function and then sleeps for `interval` seconds."""
     resources_instances = []
     for resource, config in configuration.items():
@@ -84,9 +85,9 @@ def run(configuration, global_configuration, plugins):
     with suppress(KeyboardInterrupt):
         while pid is None or _pid_exists(pid):
             for resource, config in resources_instances:
-                resource.monitor(config, header=write_header)
+                await resource.monitor(config, header=write_header)
             write_header = False
-            time.sleep(interval)
+            await curio.sleep(interval)
 
 
 def _make_parser():
@@ -123,7 +124,7 @@ def _make_parser():
 
 
 def monitor(configuration, global_configuration, plugins):
-    run(configuration, global_configuration, plugins)
+    return curio.run(run, configuration, global_configuration, plugins)
 
 
 def _run_subprocess(cmdline, in_filename, out_filename, err_filename, preexec_fn=lambda: None):

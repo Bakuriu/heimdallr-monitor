@@ -1,11 +1,15 @@
 import datetime as dt
+import io
 import os
+import csv
 import signal
 import sys
 import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime
+
+import curio
 
 LOCAL_TIMEZONE = datetime.now(dt.timezone.utc).astimezone().tzinfo
 
@@ -87,3 +91,59 @@ def create_gentle_killer(proc, verbose):
             sys.exit(1)
 
     return kill_gently
+
+
+def grouper(n, iterable):
+    iterator = iter(iterable)
+    yield from iter(lambda: [x for _,x in zip(range(n), iterator)], [])
+
+
+class AsyncCsvWriter:
+    def __init__(self, async_file: curio.file.AsyncFile, *args, **kwargs):
+        self._async_file = async_file
+        self._csv_args = args
+        self._csv_kwargs = kwargs
+
+    def _buffer(self):
+        return io.BytesIO() if 'b' in self._async_file.mode else io.StringIO()
+
+    def _writer(self, buffer):
+        return csv.writer(buffer, *self._csv_args, **self._csv_kwargs)
+
+    async def writerow(self, row):
+        buffer = self._buffer()
+        self._writer(buffer).writerow(row)
+        await self._async_file.write(buffer.getvalue())
+
+    async def writerows(self, rows):
+        for row_group in grouper(1000, rows):
+            buffer = self._buffer()
+            self._writer(buffer).writerows(row_group)
+            await self._async_file.write(buffer.getvalue())
+
+
+class AsyncDictCsvWriter:
+    def __init__(self, async_file, fieldnames, restval="", extrasaction="raise", dialect="excel", *args, **kwds):
+        self.fieldnames = fieldnames    # list of keys for the dict
+        self.restval = restval          # for writing short dicts
+        if extrasaction.lower() not in ("raise", "ignore"):
+            raise ValueError("extrasaction (%s) must be 'raise' or 'ignore'" % extrasaction)
+        self.extrasaction = extrasaction
+        self.writer = AsyncCsvWriter(async_file, dialect, *args, **kwds)
+
+    async def writeheader(self):
+        header = dict(zip(self.fieldnames, self.fieldnames))
+        await self.writerow(header)
+
+    def _dict_to_list(self, rowdict):
+        if self.extrasaction == "raise":
+            wrong_fields = rowdict.keys() - self.fieldnames
+            if wrong_fields:
+                raise ValueError("dict contains fields not in fieldnames: " + ", ".join(map(repr, wrong_fields)))
+        return (rowdict.get(key, self.restval) for key in self.fieldnames)
+
+    async def writerow(self, rowdict):
+        await self.writer.writerow(self._dict_to_list(rowdict))
+
+    async def writerows(self, rowdicts):
+        await self.writer.writerows(map(self._dict_to_list, rowdicts))
