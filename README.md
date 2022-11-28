@@ -1,6 +1,8 @@
 # heimdallr-monitor
 
-A simple monitoring script with no dependencies.
+A simple monitoring script with only [`curio`](https://curio.readthedocs.io/en/latest/) as dependency.
+
+Mostly to investigate a little bit of asynch programming with curio and the newer `await`/`async` syntax.
 
 ## Installation
 
